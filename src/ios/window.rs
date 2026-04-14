@@ -198,14 +198,38 @@ fn register_metal_view_class() -> &'static AnyClass {
             class!(CAMetalLayer) as *const AnyClass
         }
 
-        // Touch handling methods
+        // Touch handling methods. Wrapped in catch_unwind so a Rust panic
+        // in the touch path surfaces its real message instead of aborting
+        // with the generic "panic in a function that cannot unwind" at the
+        // extern "C" boundary.
+        fn guarded(
+            phase: &'static str,
+            this: *mut AnyObject,
+            touches: *mut AnyObject,
+            event: *mut AnyObject,
+        ) {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle_touches(this, touches, event);
+            }));
+            if let Err(payload) = result {
+                let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                    (*s).to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "non-string panic payload".to_string()
+                };
+                eprintln!("GPUI iOS TOUCH PANIC ({phase}): {msg}");
+            }
+        }
+
         extern "C" fn touches_began(
             this: *mut AnyObject,
             _sel: Sel,
             touches: *mut AnyObject,
             event: *mut AnyObject,
         ) {
-            handle_touches(this, touches, event);
+            guarded("began", this, touches, event);
         }
 
         extern "C" fn touches_moved(
@@ -214,7 +238,7 @@ fn register_metal_view_class() -> &'static AnyClass {
             touches: *mut AnyObject,
             event: *mut AnyObject,
         ) {
-            handle_touches(this, touches, event);
+            guarded("moved", this, touches, event);
         }
 
         extern "C" fn touches_ended(
@@ -223,7 +247,7 @@ fn register_metal_view_class() -> &'static AnyClass {
             touches: *mut AnyObject,
             event: *mut AnyObject,
         ) {
-            handle_touches(this, touches, event);
+            guarded("ended", this, touches, event);
         }
 
         extern "C" fn touches_cancelled(
@@ -232,7 +256,7 @@ fn register_metal_view_class() -> &'static AnyClass {
             touches: *mut AnyObject,
             event: *mut AnyObject,
         ) {
-            handle_touches(this, touches, event);
+            guarded("cancelled", this, touches, event);
         }
 
         unsafe {
@@ -1352,6 +1376,42 @@ impl IosWindow {
                 if slot.is_none() {
                     *slot = Some(cb);
                 }
+            }
+        }
+    }
+}
+
+impl Drop for IosWindow {
+    fn drop(&mut self) {
+        // The GPUIMetalView and GPUITextInputView store `self as *mut c_void`
+        // in their `gpui_window_ptr` ivar. After this IosWindow is freed those
+        // pointers would dangle; the next touch or keyboard event would read
+        // the freed memory and UAF-crash. Clear both ivars here so the
+        // ivar-level null check in `handle_touches` / `insert_text` short
+        // circuits safely.
+        unsafe {
+            if !self.view.is_null() {
+                #[allow(deprecated)]
+                {
+                    *(*self.view).get_mut_ivar::<*mut c_void>(GPUI_WINDOW_IVAR) =
+                        std::ptr::null_mut();
+                }
+            }
+            if !self.text_input_view.is_null() {
+                #[allow(deprecated)]
+                {
+                    *(*self.text_input_view).get_mut_ivar::<*mut c_void>(GPUI_WINDOW_IVAR) =
+                        std::ptr::null_mut();
+                }
+            }
+
+            // Remove self from IOS_WINDOW_LIST so viewDidLayoutSubviews and
+            // status-bar appearance updates don't try to dereference the
+            // freed pointer either.
+            if let Some(wrapper) = super::ffi::IOS_WINDOW_LIST.get() {
+                let windows = &mut *wrapper.0.get();
+                let me = self as *const Self;
+                windows.retain(|&p| p != me);
             }
         }
     }

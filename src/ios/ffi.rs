@@ -286,31 +286,44 @@ pub extern "C" fn gpui_ios_request_frame(window_ptr: *mut c_void) {
         return;
     }
 
-    // Safety: window_ptr must be a valid pointer to an IosWindow
-    let window = unsafe { &*(window_ptr as *const super::window::IosWindow) };
+    let result = std::panic::catch_unwind(|| {
+        // Safety: window_ptr must be a valid pointer to an IosWindow
+        let window = unsafe { &*(window_ptr as *const super::window::IosWindow) };
 
-    // ── Momentum scrolling ───────────────────────────────────────────────
-    // Pump the momentum scroller BEFORE the render callback so that any
-    // synthetic ScrollWheel events are processed during this frame's
-    // layout/paint cycle.  This produces the smooth, decelerating inertia
-    // scroll that users expect on iOS after a fling gesture.
-    window.pump_momentum();
+        // ── Momentum scrolling ───────────────────────────────────────────────
+        // Pump the momentum scroller BEFORE the render callback so that any
+        // synthetic ScrollWheel events are processed during this frame's
+        // layout/paint cycle.  This produces the smooth, decelerating inertia
+        // scroll that users expect on iOS after a fling gesture.
+        window.pump_momentum();
 
-    // Check if text input arrived since last frame — if so, force a render
-    // so drain_pending_text() runs and the UI updates.
-    let text_dirty = crate::TEXT_INPUT_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel);
+        // Check if text input arrived since last frame — if so, force a render
+        // so drain_pending_text() runs and the UI updates.
+        let text_dirty =
+            crate::TEXT_INPUT_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel);
 
-    // Take the callback, invoke it, then restore it
-    // We must complete the borrow before invoking the callback,
-    // as the callback might try to borrow the same RefCell
-    let callback = window.request_frame_callback.borrow_mut().take();
-    if let Some(mut cb) = callback {
-        cb(RequestFrameOptions {
-            force_render: text_dirty,
-            ..Default::default()
-        });
-        // Restore the callback for the next frame
-        window.request_frame_callback.borrow_mut().replace(cb);
+        // Take the callback, invoke it, then restore it
+        // We must complete the borrow before invoking the callback,
+        // as the callback might try to borrow the same RefCell
+        let callback = window.request_frame_callback.borrow_mut().take();
+        if let Some(mut cb) = callback {
+            cb(RequestFrameOptions {
+                force_render: text_dirty,
+                ..Default::default()
+            });
+            // Restore the callback for the next frame
+            window.request_frame_callback.borrow_mut().replace(cb);
+        }
+    });
+    if let Err(payload) = result {
+        let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "non-string panic payload".to_string()
+        };
+        eprintln!("GPUI iOS FRAME PANIC: {msg}");
     }
 }
 
