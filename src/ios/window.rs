@@ -71,6 +71,22 @@ impl HasDisplayHandle for RawIosWindow {
     }
 }
 
+/// Thread-safe display-handle provider for wgpu's `InstanceDescriptor::display`.
+/// On iOS there is no separate display connection — `UiKitDisplayHandle` is a
+/// synthetic unit handle — so this type is trivially `Send + Sync + 'static`.
+#[derive(Debug, Default, Clone, Copy)]
+struct IosDisplayHandleProvider;
+
+impl HasDisplayHandle for IosDisplayHandleProvider {
+    fn display_handle(
+        &self,
+    ) -> std::result::Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError>
+    {
+        let handle = UiKitDisplayHandle::new();
+        Ok(unsafe { raw_window_handle::DisplayHandle::borrow_raw(handle.into()) })
+    }
+}
+
 static METAL_VIEW_CLASS_REGISTERED: std::sync::Once = std::sync::Once::new();
 static VC_CLASS_REGISTERED: std::sync::Once = std::sync::Once::new();
 static TEXT_INPUT_VIEW_CLASS_REGISTERED: std::sync::Once = std::sync::Once::new();
@@ -607,26 +623,30 @@ impl IosWindow {
                 preferred_present_mode: None,
             };
 
+            let raw_window = RawIosWindow {
+                view: ios_window.view as *mut c_void,
+            };
+
+            let window_handle = raw_window
+                .window_handle()
+                .expect("iOS window handle unavailable");
+            let display_handle = raw_window
+                .display_handle()
+                .expect("iOS display handle unavailable");
+
+            // wgpu v29 requires the display handle on the InstanceDescriptor
+            // (not just on the per-surface target). On iOS this is a synthetic
+            // `UiKitDisplayHandle` since UIKit has no separate display connection.
             let metal_instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                 backends: wgpu::Backends::METAL,
                 flags: wgpu::InstanceFlags::default(),
                 backend_options: wgpu::BackendOptions::default(),
                 memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-                display: None,
+                display: Some(Box::new(IosDisplayHandleProvider)),
             });
 
-            let raw_window = RawIosWindow {
-                view: ios_window.view as *mut c_void,
-            };
-
-            // Build a temporary surface for WgpuContext initialisation
-            // (adapter selection needs a surface to test compatibility).
-            let window_handle = raw_window
-                .window_handle()
-                .expect("iOS window handle unavailable");
-
             let target = wgpu::SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle: None,
+                raw_display_handle: Some(display_handle.as_raw()),
                 raw_window_handle: window_handle.as_raw(),
             };
 
