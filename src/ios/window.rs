@@ -1189,10 +1189,32 @@ impl IosWindow {
             // send key events below.
             let dispatched = crate::dispatch_text_input(&text_str);
 
-            // Try the input handler (for GPUI's built-in text fields)
+            // Try the input handler (for GPUI's built-in text fields).
+            //
+            // Take the handler OUT of the RefCell before calling into it.
+            // `replace_text_in_range` re-enters GPUI, which calls
+            // `take_input_handler` — another `input_handler.borrow_mut()`.
+            // Holding the borrow across that re-entrant call panics with
+            // "already mutably borrowed", and because we're inside the
+            // `extern "C"` `insertText:` callback the panic cannot unwind
+            // across the FFI boundary → `abort()` (SIGABRT) on every
+            // keystroke. Take/restore (as the macOS platform does) keeps no
+            // borrow alive during the call.
             if !dispatched {
-                if let Some(handler) = self.input_handler.borrow_mut().as_mut() {
-                    handler.replace_text_in_range(None, &text_str);
+                let mut handler = self.input_handler.borrow_mut().take();
+                let had_handler = handler.is_some();
+                if let Some(h) = handler.as_mut() {
+                    h.replace_text_in_range(None, &text_str);
+                }
+                // GPUI may have re-installed a handler during the call;
+                // only restore ours if the slot is still empty.
+                {
+                    let mut slot = self.input_handler.borrow_mut();
+                    if slot.is_none() {
+                        *slot = handler;
+                    }
+                }
+                if had_handler {
                     return;
                 }
             }
