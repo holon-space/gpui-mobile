@@ -205,6 +205,8 @@ pub enum KeyboardType {
     URL,
     /// Decimal number pad (digits and decimal point).
     Decimal,
+    /// Text keyboard configured for password entry.
+    Password,
 }
 
 /// Show the software keyboard with the default keyboard type.

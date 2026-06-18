@@ -299,8 +299,7 @@ pub extern "C" fn gpui_ios_request_frame(window_ptr: *mut c_void) {
 
         // Check if text input arrived since last frame — if so, force a render
         // so drain_pending_text() runs and the UI updates.
-        let text_dirty =
-            crate::TEXT_INPUT_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel);
+        let text_dirty = crate::TEXT_INPUT_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel);
 
         // Take the callback, invoke it, then restore it
         // We must complete the borrow before invoking the callback,

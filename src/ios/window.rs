@@ -1123,6 +1123,9 @@ impl IosWindow {
                 KeyboardType::NumberPad => 4,    // UIKeyboardTypeNumberPad
                 KeyboardType::URL => 3,          // UIKeyboardTypeURL
                 KeyboardType::Decimal => 8,      // UIKeyboardTypeDecimalPad
+                // iOS has no password keyboard type; secure entry is a separate
+                // `isSecureTextEntry` flag.  Use the default keyboard.
+                KeyboardType::Password => 0, // UIKeyboardTypeDefault
             };
             log::info!(
                 "GPUI iOS: text_input_view={:p}, setKeyboardType: {}",
