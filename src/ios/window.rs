@@ -1187,6 +1187,34 @@ impl IosWindow {
 
             log::info!("GPUI iOS: Text input: {:?}", text_str);
 
+            // Soft-keyboard Return arrives here as the character "\n" (iOS
+            // delivers it through `insertText:`, not as a hardware key event).
+            // Inserting it as text below would drop a literal newline into the
+            // focused field and never reach GPUI's keymap, so the editor's
+            // `capture_action(|_: &Enter|)` arm — which reads the live caret to
+            // supply `split_block`'s `position` and commit the block — never
+            // fires. Translate Return into an `enter` keystroke through the same
+            // `input_callback` the hardware-keyboard path uses, so it traverses
+            // the identical keymap → `Enter` action → editor capture route as
+            // desktop. This mirrors `handle_delete_backward`, which already does
+            // this for Backspace; Return was the missing symmetric case.
+            if text_str == "\n" || text_str == "\r" || text_str == "\r\n" {
+                let keystroke = gpui::Keystroke {
+                    modifiers: Modifiers::default(),
+                    key: "enter".to_string(),
+                    key_char: None,
+                };
+                let event = PlatformInput::KeyDown(gpui::KeyDownEvent {
+                    keystroke,
+                    is_held: false,
+                    prefer_character_input: false,
+                });
+                if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
+                    callback(event);
+                }
+                return;
+            }
+
             // Try the global text input callback (for our TextInput components).
             // The text is captured in PENDING_TEXT regardless of whether we also
             // send key events below.
