@@ -682,6 +682,29 @@ impl AndroidWindow {
         state.renderer = Some(renderer);
     }
 
+    /// Capture `scene` into an RGBA image via the renderer's offscreen readback
+    /// path (`gpui_wgpu::WgpuRenderer::render_scene_to_image`). Backs the
+    /// in-app MCP `screenshot` tool on Android, where there is no OS-level
+    /// window-capture path. Fails loud when the renderer is unavailable
+    /// (surface lost / window backgrounded) instead of returning a blank image.
+    pub fn render_to_image(&self, scene: &gpui::Scene) -> Result<image::RgbaImage> {
+        // Take the renderer out of state (as `draw` does) so the readback's
+        // blocking `device.poll(Wait)` never holds the state lock.
+        let mut renderer = {
+            let mut state = self.state.lock();
+            state
+                .renderer
+                .take()
+                .context("cannot capture screenshot: renderer unavailable (surface lost)")?
+        };
+
+        let result = renderer.render_scene_to_image(scene);
+
+        let mut state = self.state.lock();
+        state.renderer = Some(renderer);
+        result
+    }
+
     /// Invoke the `request_frame_callback` if one is registered.
     ///
     /// Called by the event loop on every iteration (~60 fps).
@@ -1853,6 +1876,10 @@ impl PlatformWindow for AndroidPlatformWindow {
         );
 
         self.window.draw(scene);
+    }
+
+    fn render_to_image(&self, scene: &gpui::Scene) -> Result<image::RgbaImage> {
+        self.window.render_to_image(scene)
     }
 
     fn completed_frame(&self) {
