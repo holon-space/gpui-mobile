@@ -113,11 +113,27 @@ pub fn with_env<T>(f: impl FnOnce(&mut jni::Env) -> Result<T, String>) -> Result
     let vm = java_vm_safe()?;
     let mut result: Option<Result<T, String>> = None;
     vm.attach_current_thread(|env: &mut jni::Env| -> Result<(), jni::errors::Error> {
+        // Every JNI call fails outright while an exception is pending, so one
+        // leaked exception poisons every later unrelated call on this thread.
+        drain_pending_exception(env, "on entry to with_env");
         result = Some(f(env));
+        drain_pending_exception(env, "left pending by with_env body");
         Ok(())
     })
     .map_err(|e: jni::errors::Error| e.to_string())?;
     result.unwrap()
+}
+
+/// Clear a pending Java exception, describing it to logcat first.
+///
+/// Loud on purpose: a pending exception here means some earlier JNI call left
+/// one behind, and the symptom lands on whatever runs next.
+pub fn drain_pending_exception(env: &mut jni::Env<'_>, context: &str) {
+    if env.exception_check().unwrap_or(false) {
+        log::error!("pending Java exception {context} — describing and clearing");
+        env.exception_describe();
+        env.exception_clear();
+    }
 }
 
 /// Convenience alias: kept so existing callers that import `obtain_env`
@@ -804,10 +820,32 @@ pub fn run_event_loop(app: &AndroidApp) {
     log::info!("run_event_loop: exiting main loop");
 }
 
+/// Whether `GpuiPlatformView` was already found to be absent from this app.
+///
+/// Embedders that ship no platform views have no such class, and the lifecycle
+/// hooks below run on every Resume/Pause — retrying the lookup each time floods
+/// logcat and leaves a Java exception pending on the thread for whatever runs next.
+static PLATFORM_VIEW_CLASS_ABSENT: AtomicBool = AtomicBool::new(false);
+
+/// Look up the platform-view helper class, remembering a first failure.
+fn platform_view_class<'local>(env: &mut jni::Env<'local>) -> Option<jni::objects::JClass<'local>> {
+    if PLATFORM_VIEW_CLASS_ABSENT.load(Ordering::Relaxed) {
+        return None;
+    }
+    match find_app_class(env, "dev.gpui.mobile.GpuiPlatformView") {
+        Ok(class) => Some(class),
+        Err(_) => {
+            log::info!("GpuiPlatformView not present — platform-view lifecycle hooks disabled");
+            PLATFORM_VIEW_CLASS_ABSENT.store(true, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
 /// Pause all platform views when the app goes to background.
 fn pause_platform_views() {
     let _ = with_env(|env| {
-        if let Ok(helper_class) = find_app_class(env, "dev.gpui.mobile.GpuiPlatformView") {
+        if let Some(helper_class) = platform_view_class(env) {
             let _ = env.call_static_method(
                 &helper_class,
                 jni::jni_str!("pauseAll"),
@@ -823,7 +861,7 @@ fn pause_platform_views() {
 /// Resume all platform views when the app returns to foreground.
 fn resume_platform_views() {
     let _ = with_env(|env| {
-        if let Ok(helper_class) = find_app_class(env, "dev.gpui.mobile.GpuiPlatformView") {
+        if let Some(helper_class) = platform_view_class(env) {
             let _ = env.call_static_method(
                 &helper_class,
                 jni::jni_str!("resumeAll"),
@@ -839,7 +877,7 @@ fn resume_platform_views() {
 /// Dispose all platform views during app shutdown.
 fn dispose_all_platform_views() {
     let _ = with_env(|env| {
-        if let Ok(helper_class) = find_app_class(env, "dev.gpui.mobile.GpuiPlatformView") {
+        if let Some(helper_class) = platform_view_class(env) {
             let _ = env.call_static_method(
                 &helper_class,
                 jni::jni_str!("disposeAll"),

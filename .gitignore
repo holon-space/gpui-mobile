@@ -77,3 +77,6 @@ target/doc/
 # Temporary files
 tmp/
 temp/
+
+# local build dir for the Holon IME device iteration
+/target-holon-ime/

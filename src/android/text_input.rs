@@ -139,33 +139,49 @@ pub fn sync_state_to_java(input_handler: &mut PlatformInputHandler) {
 }
 
 pub fn show_keyboard(keyboard_type: crate::KeyboardType) {
-    let _ = jni_helpers::with_env(|env| {
-        let activity = jni_helpers::activity(env)?;
-        let class = jni_helpers::find_app_class(env, "dev.gpui.mobile.GpuiTextInputView")?;
-        env.call_static_method(
-            &class,
-            jni::jni_str!("showKeyboard"),
-            jni::jni_sig!("(Landroid/app/Activity;I)V"),
-            &[JValue::Object(&activity), JValue::Int(keyboard_type as i32)],
-        )
-        .e()?;
-        Ok(())
-    });
+    log_jni_failure(
+        "show_keyboard",
+        jni_helpers::with_env(|env| {
+            let activity = jni_helpers::activity(env)?;
+            let class = jni_helpers::find_app_class(env, "dev.gpui.mobile.GpuiTextInputView")?;
+            env.call_static_method(
+                &class,
+                jni::jni_str!("showKeyboard"),
+                jni::jni_sig!("(Landroid/app/Activity;I)V"),
+                &[JValue::Object(&activity), JValue::Int(keyboard_type as i32)],
+            )
+            .e()?;
+            Ok(())
+        }),
+    );
 }
 
 pub fn hide_keyboard() {
-    let _ = jni_helpers::with_env(|env| {
-        let activity = jni_helpers::activity(env)?;
-        let class = jni_helpers::find_app_class(env, "dev.gpui.mobile.GpuiTextInputView")?;
-        env.call_static_method(
-            &class,
-            jni::jni_str!("hideKeyboard"),
-            jni::jni_sig!("(Landroid/app/Activity;)V"),
-            &[JValue::Object(&activity)],
-        )
-        .e()?;
-        Ok(())
-    });
+    log_jni_failure(
+        "hide_keyboard",
+        jni_helpers::with_env(|env| {
+            let activity = jni_helpers::activity(env)?;
+            let class = jni_helpers::find_app_class(env, "dev.gpui.mobile.GpuiTextInputView")?;
+            env.call_static_method(
+                &class,
+                jni::jni_str!("hideKeyboard"),
+                jni::jni_sig!("(Landroid/app/Activity;)V"),
+                &[JValue::Object(&activity)],
+            )
+            .e()?;
+            Ok(())
+        }),
+    );
+}
+
+/// Report a failed IME JNI call instead of discarding it.
+///
+/// These failures are otherwise invisible: the keyboard simply never appears,
+/// with nothing in logcat to say why.
+fn log_jni_failure(operation: &str, result: Result<(), String>) {
+    if let Err(error) = result {
+        log::error!("{operation} failed: {error}");
+    }
 }
 
 fn jrange(start: i32, end: i32) -> Range<usize> {
