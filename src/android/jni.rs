@@ -205,51 +205,19 @@ pub fn find_app_class<'local>(
     env: &mut jni::Env<'local>,
     class_name: &str,
 ) -> Result<jni::objects::JClass<'local>, String> {
-    let act = activity(env)?;
-
-    // activity.getClassLoader() — call on the Context instance directly.
-    // Do NOT use activity.getClass().getClassLoader(): NativeActivity is a
-    // framework class loaded by BootClassLoader, which cannot see app classes.
-    let class_loader = env
-        .call_method(
-            &act,
-            jni::jni_str!("getClassLoader"),
-            jni::jni_sig!("()Ljava/lang/ClassLoader;"),
-            &[],
-        )
-        .and_then(|v| v.l())
+    // `Env::load_class` is the jni crate's own loader-aware lookup: it consults the
+    // thread context class loader (which `android-activity` sets up), falls back to
+    // FindClass, and — unlike a hand-rolled reflective `loadClass` call — keeps every
+    // intermediate reference inside a scope the JNI runtime accepts. Building the
+    // name string and invoking loadClass by hand instead made ART's CheckJNI abort
+    // the process: "jstring is an invalid JNI transition frame reference ... from
+    // VMClassLoader.findLoadedClass".
+    env.load_class(jni::strings::JNIString::new(class_name))
         .map_err(|e| {
-            env.exception_clear();
-            let msg = format!("getClassLoader failed: {e}");
-            log::error!("find_app_class({class_name}): {msg}");
+            let msg = format!("load_class({class_name}) failed: {e}");
+            log::error!("find_app_class: {msg}");
             msg
-        })?;
-
-    // classLoader.loadClass("dev.gpui.mobile.GpuiHelper")
-    let jname = env.new_string(class_name).e()?;
-    let loaded = env
-        .call_method(
-            &class_loader,
-            jni::jni_str!("loadClass"),
-            jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Class;"),
-            &[JValue::Object(&jname)],
-        )
-        .and_then(|v| v.l())
-        .map_err(|e| {
-            // Print full Java stack trace to logcat, then clear.
-            env.exception_describe();
-            env.exception_clear();
-            let msg = format!("loadClass({class_name}) failed: {e}");
-            log::error!("{msg}");
-            msg
-        })?;
-
-    log::debug!("find_app_class: loaded {class_name}");
-    // `cast_local` consumes `loaded`, so the class has exactly one owner. Wrapping
-    // `loaded.as_raw()` in a second `JClass` instead would leave two owners of one
-    // reference: `loaded` deletes it on drop and the returned class dangles.
-    env.cast_local::<jni::objects::JClass>(loaded)
-        .map_err(|e| format!("loadClass({class_name}) returned a non-Class object: {e}"))
+        })
 }
 
 // ── global state ─────────────────────────────────────────────────────────────
