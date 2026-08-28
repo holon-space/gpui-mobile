@@ -129,7 +129,7 @@ pub fn with_env<T>(f: impl FnOnce(&mut jni::Env) -> Result<T, String>) -> Result
 /// Loud on purpose: a pending exception here means some earlier JNI call left
 /// one behind, and the symptom lands on whatever runs next.
 pub fn drain_pending_exception(env: &mut jni::Env<'_>, context: &str) {
-    if env.exception_check().unwrap_or(false) {
+    if env.exception_check() {
         log::error!("pending Java exception {context} — describing and clearing");
         env.exception_describe();
         env.exception_clear();
@@ -144,19 +144,32 @@ pub fn obtain_env<T>(f: impl FnOnce(&mut jni::Env) -> Result<T, String>) -> Resu
     with_env(f)
 }
 
-/// Get the Activity as a [`JObject`].
+/// Get the Activity as a [`JObject`] local reference.
 ///
-/// `activity_as_ptr()` returns a JNI global reference from `android-activity`
-/// that is valid for the lifetime of the app. We wrap it in a `JObject`.
-///
-/// Requires `&Env` because jni 0.22's `JObject::from_raw` binds the
-/// local-reference-frame lifetime.
+/// `activity_as_ptr()` hands back a JNI **global** reference owned by
+/// `android-activity` for the life of the process, but `JObject::from_raw`
+/// documents that it takes an owned **local** reference belonging to the current
+/// frame. Reinterpreting the global as a local corrupts that frame's reference
+/// table; ART's CheckJNI reports the damage against whatever reference it
+/// validates next ("invalid JNI transition frame reference"), and without
+/// CheckJNI the call simply misbehaves. So materialise a genuine local
+/// reference instead of casting the global.
 pub fn activity<'local>(env: &jni::Env<'local>) -> Result<JObject<'local>, String> {
     let ptr = activity_as_ptr();
     if ptr.is_null() {
         return Err("Activity not available".into());
     }
-    Ok(unsafe { JObject::from_raw(env, ptr as jni::sys::jobject) })
+    let raw_env = env.get_raw();
+    // SAFETY: `raw_env` is the current thread's JNIEnv, and `ptr` is a live
+    // global reference; `NewLocalRef` accepts any reference kind.
+    let local = unsafe {
+        let new_local_ref = (**raw_env).v1_2.NewLocalRef;
+        new_local_ref(raw_env, ptr as jni::sys::jobject)
+    };
+    if local.is_null() {
+        return Err("NewLocalRef returned null for the Activity".into());
+    }
+    Ok(unsafe { JObject::from_raw(env, local) })
 }
 
 /// Convert a Java String (`JObject` wrapping a `java.lang.String`) to a Rust `String`.
@@ -232,7 +245,11 @@ pub fn find_app_class<'local>(
         })?;
 
     log::debug!("find_app_class: loaded {class_name}");
-    Ok(unsafe { jni::objects::JClass::from_raw(env, loaded.as_raw()) })
+    // `cast_local` consumes `loaded`, so the class has exactly one owner. Wrapping
+    // `loaded.as_raw()` in a second `JClass` instead would leave two owners of one
+    // reference: `loaded` deletes it on drop and the returned class dangles.
+    env.cast_local::<jni::objects::JClass>(loaded)
+        .map_err(|e| format!("loadClass({class_name}) returned a non-Class object: {e}"))
 }
 
 // ── global state ─────────────────────────────────────────────────────────────
