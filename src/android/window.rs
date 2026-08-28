@@ -1466,6 +1466,10 @@ impl PlatformWindow for AndroidPlatformWindow {
                 crate::android::text_input::sync_state_to_java(input_handler);
                 drained
             } else {
+                // No handler means no editor is focused. Queued IME edits cannot be
+                // applied and will sit in the queue indefinitely, so say so: the
+                // symptom is otherwise a keyboard that types into nothing.
+                crate::android::text_input::report_undeliverable_commands();
                 false
             };
 

@@ -36,6 +36,62 @@ pub enum TextInputCommand {
     UnmarkText,
 }
 
+/// An IME call to make from the dedicated JNI thread.
+enum ImeCommand {
+    ShowKeyboard(crate::KeyboardType),
+    HideKeyboard,
+    UpdateEditingState {
+        text: String,
+        selection: (i32, i32, bool),
+        marked: (i32, i32),
+    },
+}
+
+static IME_TX: OnceLock<std::sync::mpsc::Sender<ImeCommand>> = OnceLock::new();
+
+
+/// Hand an IME call to the dedicated JNI thread.
+///
+/// These calls must NOT run on `android_main`. By the time a tap reaches the
+/// keyboard the gpui draw and input-dispatch frames have consumed most of that
+/// thread's stack, and ART refuses any Java upcall whose stack reserve check
+/// fails — it throws `StackOverflowError`, which on some devices cannot even be
+/// formatted without throwing again. A dedicated thread with its own large stack
+/// removes the depth sensitivity instead of hoping the remaining stack is enough.
+fn send_ime(command: ImeCommand) {
+    let sender = IME_TX.get_or_init(spawn_ime_thread);
+    if let Err(e) = sender.send(command) {
+        log::error!("IME JNI thread is not accepting commands: {e}");
+    }
+}
+
+fn spawn_ime_thread() -> std::sync::mpsc::Sender<ImeCommand> {
+    let (tx, rx) = std::sync::mpsc::channel::<ImeCommand>();
+    let started = std::thread::Builder::new()
+        .name("gpui-ime-jni".to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            // The channel is FIFO and this is its only consumer, so IME calls
+            // keep the order the editor issued them in.
+            for command in rx {
+                match command {
+                    ImeCommand::ShowKeyboard(keyboard_type) => call_show_keyboard(keyboard_type),
+                    ImeCommand::HideKeyboard => call_hide_keyboard(),
+                    ImeCommand::UpdateEditingState {
+                        text,
+                        selection,
+                        marked,
+                    } => call_update_editing_state(&text, selection, marked),
+                }
+            }
+            log::error!("IME JNI thread exiting: every sender was dropped");
+        });
+    if let Err(e) = started {
+        log::error!("could not start the IME JNI thread, the keyboard will not work: {e}");
+    }
+    tx
+}
+
 static COMMANDS: OnceLock<Mutex<VecDeque<TextInputCommand>>> = OnceLock::new();
 static DIRTY: AtomicBool = AtomicBool::new(false);
 
@@ -49,16 +105,39 @@ pub fn push(command: TextInputCommand) {
     }
     DIRTY.store(true, Ordering::Release);
     crate::TEXT_INPUT_DIRTY.store(true, Ordering::Release);
-    if let Some(platform) = jni_helpers::platform() {
-        if let Some(window) = platform.primary_window() {
-            window.request_frame();
-        }
-    }
+    // Deliberately no `request_frame()` here. This runs on the IME's thread, and
+    // `AndroidWindow::request_frame` invokes the frame callback synchronously on
+    // the caller — which would run the drain, the Java mirror, and a gpui draw
+    // off the main thread. The event loop calls `request_frame` itself every
+    // iteration, so the flags above are enough for the edit to be picked up.
 }
 
 pub fn has_pending() -> bool {
     DIRTY.load(Ordering::Acquire)
 }
+
+/// Report IME edits that arrived while no editor was focused.
+///
+/// Called from the frame callback when the input handler is unset. The queue is
+/// left intact in case an editor takes focus later, but the condition is logged:
+/// silently holding keystrokes is what makes this look like a keyboard typing
+/// into a void. Rate limited because the frame callback runs continuously.
+pub fn report_undeliverable_commands() {
+    if !has_pending() {
+        return;
+    }
+    let pending = commands().lock().map(|q| q.len()).unwrap_or(0);
+    let reported = UNDELIVERABLE_REPORTS.fetch_add(1, Ordering::Relaxed);
+    if reported % 120 == 0 {
+        log::error!(
+            "{pending} IME edit(s) cannot be applied: no input handler is set, so no \
+             editor is focused. Keystrokes are being held, not applied."
+        );
+    }
+}
+
+static UNDELIVERABLE_REPORTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 pub fn drain_into(input_handler: &mut PlatformInputHandler) -> bool {
     let mut drained = false;
@@ -128,8 +207,18 @@ pub fn sync_state_to_java(input_handler: &mut PlatformInputHandler) {
         .map(|range| (range.start as i32, range.end as i32))
         .unwrap_or((-1, -1));
 
+    // Reading the handler is Rust-side and must happen here, on the main thread;
+    // only the Java upcall is handed off.
+    send_ime(ImeCommand::UpdateEditingState {
+        text,
+        selection,
+        marked,
+    });
+}
+
+fn call_update_editing_state(text: &str, selection: (i32, i32, bool), marked: (i32, i32)) {
     log_jni_failure(
-        "sync_state_to_java",
+        "updateEditingState",
         jni_helpers::with_env(|env| {
             let class = jni_helpers::find_app_class(env, "dev.gpui.mobile.GpuiTextInputView")?;
             let text = env.new_string(text).e()?;
@@ -153,6 +242,10 @@ pub fn sync_state_to_java(input_handler: &mut PlatformInputHandler) {
 }
 
 pub fn show_keyboard(keyboard_type: crate::KeyboardType) {
+    send_ime(ImeCommand::ShowKeyboard(keyboard_type));
+}
+
+fn call_show_keyboard(keyboard_type: crate::KeyboardType) {
     log_jni_failure(
         "show_keyboard",
         jni_helpers::with_env(|env| {
@@ -171,6 +264,10 @@ pub fn show_keyboard(keyboard_type: crate::KeyboardType) {
 }
 
 pub fn hide_keyboard() {
+    send_ime(ImeCommand::HideKeyboard);
+}
+
+fn call_hide_keyboard() {
     log_jni_failure(
         "hide_keyboard",
         jni_helpers::with_env(|env| {

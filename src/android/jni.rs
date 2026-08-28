@@ -194,6 +194,69 @@ impl<T> JniExt<T> for jni::errors::Result<T> {
     }
 }
 
+/// Application classes resolved once at `JNI_OnLoad`, keyed by dot-notation name.
+static APP_CLASSES: OnceLock<
+    Vec<(
+        &'static str,
+        jni::objects::Global<jni::objects::JClass<'static>>,
+    )>,
+> = OnceLock::new();
+
+/// The application classes this library calls into.
+const CACHED_APP_CLASSES: &[&str] = &[
+    "dev.gpui.mobile.GpuiTextInputView",
+    "dev.gpui.mobile.GpuiPlatformView",
+];
+
+/// Resolve and cache the application classes while the app class loader is in scope.
+///
+/// The JVM calls this from `System.loadLibrary`, so the calling context is the
+/// class that loaded us — `FindClass` reaches application classes here, which it
+/// cannot do later from the `android_main` thread. Caching now is what lets
+/// [`find_app_class`] avoid touching a class loader on the input path at all.
+///
+/// # Safety
+/// Called by the JVM with a valid `JavaVM` pointer.
+#[no_mangle]
+pub unsafe extern "system" fn JNI_OnLoad(
+    vm: *mut jni::sys::JavaVM,
+    _reserved: *mut c_void,
+) -> jni::sys::jint {
+    let version = jni::sys::JNI_VERSION_1_6;
+    let vm = unsafe { JavaVM::from_raw(vm) };
+
+    let cached: Result<Vec<_>, jni::errors::Error> =
+        vm.attach_current_thread(|env: &mut jni::Env| {
+            let mut classes = Vec::with_capacity(CACHED_APP_CLASSES.len());
+            for name in CACHED_APP_CLASSES {
+                let descriptor = name.replace('.', "/");
+                match env
+                    .find_class(jni::strings::JNIString::new(&descriptor))
+                    .and_then(|class| env.new_global_ref(class))
+                {
+                    Ok(global) => classes.push((*name, global)),
+                    Err(e) => {
+                        // Loud but not fatal: a missing optional class must not stop the
+                        // library from loading. The failure resurfaces at first use.
+                        drain_pending_exception(env, "after JNI_OnLoad find_class");
+                        log::error!("JNI_OnLoad: could not cache {name}: {e}");
+                    }
+                }
+            }
+            Ok(classes)
+        });
+
+    match cached {
+        Ok(classes) => {
+            log::info!("JNI_OnLoad: cached {} application class(es)", classes.len());
+            let _ = APP_CLASSES.set(classes);
+        }
+        Err(e) => log::error!("JNI_OnLoad: could not attach to the JVM: {e}"),
+    }
+
+    version
+}
+
 /// Find an application class by name using the Activity's classloader.
 ///
 /// From native threads, `JNIEnv::FindClass` uses the system classloader
@@ -205,19 +268,27 @@ pub fn find_app_class<'local>(
     env: &mut jni::Env<'local>,
     class_name: &str,
 ) -> Result<jni::objects::JClass<'local>, String> {
-    // `Env::load_class` is the jni crate's own loader-aware lookup: it consults the
-    // thread context class loader (which `android-activity` sets up), falls back to
-    // FindClass, and — unlike a hand-rolled reflective `loadClass` call — keeps every
-    // intermediate reference inside a scope the JNI runtime accepts. Building the
-    // name string and invoking loadClass by hand instead made ART's CheckJNI abort
-    // the process: "jstring is an invalid JNI transition frame reference ... from
-    // VMClassLoader.findLoadedClass".
-    env.load_class(jni::strings::JNIString::new(class_name))
-        .map_err(|e| {
-            let msg = format!("load_class({class_name}) failed: {e}");
+    // Serve from the JNI_OnLoad cache. Looking a class loader up here instead is
+    // not an option: on devices where the thread context class loader lookup
+    // throws, `Env::load_class` recurses into its own exception classifier
+    // (LoaderContext::load_class -> catch -> JSecurityExceptionAPI::get ->
+    // load_class_for_type -> LoaderContext::load_class) until the stack overflows
+    // and the process takes SIGSEGV.
+    let cached = APP_CLASSES
+        .get()
+        .and_then(|classes| classes.iter().find(|(name, _)| *name == class_name))
+        .ok_or_else(|| {
+            let msg = format!(
+                "{class_name} was never cached by JNI_OnLoad — either \
+                 System.loadLibrary was not called for this library, or the class \
+                 is absent from the APK"
+            );
             log::error!("find_app_class: {msg}");
             msg
-        })
+        })?;
+
+    env.new_local_ref(&cached.1)
+        .map_err(|e| format!("new_local_ref({class_name}) failed: {e}"))
 }
 
 // ── global state ─────────────────────────────────────────────────────────────
