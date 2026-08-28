@@ -97,45 +97,59 @@ pub fn drain_into(input_handler: &mut PlatformInputHandler) -> bool {
     drained
 }
 
+/// Mirror the editor's text and selection into the Java-side host view.
+///
+/// Java computes the replacement range of every `commitText` from this mirror,
+/// so a wrong or empty mirror silently sends each keystroke to the wrong offset.
+/// When the handler cannot be read, leave the mirror alone rather than
+/// overwriting it with placeholder state.
 pub fn sync_state_to_java(input_handler: &mut PlatformInputHandler) {
     let mut adjusted = None;
-    let text = input_handler
-        .text_for_range(0..usize::MAX, &mut adjusted)
-        .unwrap_or_default();
-    let selection = input_handler
-        .selected_text_range(true)
-        .map(|selection| {
-            (
-                selection.range.start as i32,
-                selection.range.end as i32,
-                selection.reversed,
-            )
-        })
-        .unwrap_or((-1, -1, false));
+    let Some(text) = input_handler.text_for_range(0..usize::MAX, &mut adjusted) else {
+        log::error!(
+            "sync_state_to_java: text_for_range returned None — Java mirror left unchanged"
+        );
+        return;
+    };
+    let Some(selection) = input_handler.selected_text_range(true).map(|selection| {
+        (
+            selection.range.start as i32,
+            selection.range.end as i32,
+            selection.reversed,
+        )
+    }) else {
+        log::error!(
+            "sync_state_to_java: selected_text_range returned None — Java mirror left unchanged"
+        );
+        return;
+    };
     let marked = input_handler
         .marked_text_range()
         .map(|range| (range.start as i32, range.end as i32))
         .unwrap_or((-1, -1));
 
-    let _ = jni_helpers::with_env(|env| {
-        let class = jni_helpers::find_app_class(env, "dev.gpui.mobile.GpuiTextInputView")?;
-        let text = env.new_string(text).e()?;
-        env.call_static_method(
-            &class,
-            jni::jni_str!("updateEditingState"),
-            jni::jni_sig!("(Ljava/lang/String;IIIIZ)V"),
-            &[
-                JValue::Object(&text),
-                JValue::Int(selection.0),
-                JValue::Int(selection.1),
-                JValue::Int(marked.0),
-                JValue::Int(marked.1),
-                JValue::Bool(selection.2),
-            ],
-        )
-        .e()?;
-        Ok(())
-    });
+    log_jni_failure(
+        "sync_state_to_java",
+        jni_helpers::with_env(|env| {
+            let class = jni_helpers::find_app_class(env, "dev.gpui.mobile.GpuiTextInputView")?;
+            let text = env.new_string(text).e()?;
+            env.call_static_method(
+                &class,
+                jni::jni_str!("updateEditingState"),
+                jni::jni_sig!("(Ljava/lang/String;IIIIZ)V"),
+                &[
+                    JValue::Object(&text),
+                    JValue::Int(selection.0),
+                    JValue::Int(selection.1),
+                    JValue::Int(marked.0),
+                    JValue::Int(marked.1),
+                    JValue::Bool(selection.2),
+                ],
+            )
+            .e()?;
+            Ok(())
+        }),
+    );
 }
 
 pub fn show_keyboard(keyboard_type: crate::KeyboardType) {

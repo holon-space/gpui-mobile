@@ -1259,11 +1259,10 @@ impl PlatformWindow for AndroidPlatformWindow {
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
-        let mut slot = self.input_handler.0.lock();
-        *slot = Some(input_handler);
-        if let Some(input_handler) = slot.as_mut() {
-            crate::android::text_input::sync_state_to_java(input_handler);
-        }
+        // Store only. gpui calls this from inside `Window::draw`, with the `App`
+        // already borrowed, so reading the handler here fails and would mirror
+        // sentinel state to Java. The frame callback does the mirroring instead.
+        *self.input_handler.0.lock() = Some(input_handler);
     }
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
@@ -1454,14 +1453,18 @@ impl PlatformWindow for AndroidPlatformWindow {
             }
 
             // Apply any IME edit commands queued by GpuiTextInputView since the
-            // last frame.  This must run on the main thread, which the frame
-            // callback guarantees.
-            let text_input_dirty = if crate::android::text_input::has_pending() {
-                if let Some(input_handler) = input_handler.0.lock().as_mut() {
-                    crate::android::text_input::drain_into(input_handler)
-                } else {
-                    false
-                }
+            // last frame, then mirror the resulting text state back to Java.
+            // Both must run on the main thread, which the frame callback
+            // guarantees, and from here rather than `set_input_handler`, which
+            // runs with the `App` already borrowed. The mirror runs every frame,
+            // not only when edits were pending: Java's copy is what every
+            // `commitText` computes its replacement range from, so leaving it
+            // stale sends each keystroke to the wrong offset.
+            let text_input_dirty = if let Some(input_handler) = input_handler.0.lock().as_mut() {
+                let drained = crate::android::text_input::has_pending()
+                    && crate::android::text_input::drain_into(input_handler);
+                crate::android::text_input::sync_state_to_java(input_handler);
+                drained
             } else {
                 false
             };
