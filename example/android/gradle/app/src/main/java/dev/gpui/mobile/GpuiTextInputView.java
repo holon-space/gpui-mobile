@@ -7,6 +7,7 @@ import android.text.Editable;
 import android.text.InputType;
 import android.text.Selection;
 import android.text.SpannableStringBuilder;
+import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.inputmethod.BaseInputConnection;
@@ -164,7 +165,12 @@ public final class GpuiTextInputView extends View {
     @Override
     public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
         outAttrs.inputType = androidInputType(sKeyboardType);
-        outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN | EditorInfo.IME_ACTION_DONE;
+        // An explicit action other than IME_ACTION_NONE replaces the IME's
+        // Enter key with that action's button, which leaves a multi-line editor
+        // with no way to enter a line break.
+        boolean multiLine = (outAttrs.inputType & InputType.TYPE_TEXT_FLAG_MULTI_LINE) != 0;
+        outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN
+                | (multiLine ? EditorInfo.IME_ACTION_NONE : EditorInfo.IME_ACTION_DONE);
         outAttrs.initialSelStart = Selection.getSelectionStart(editable);
         outAttrs.initialSelEnd = Selection.getSelectionEnd(editable);
         return new GpuiInputConnection(this, outAttrs);
@@ -214,6 +220,12 @@ public final class GpuiTextInputView extends View {
 
         @Override
         public boolean commitText(CharSequence text, int newCursorPosition) {
+            if (isLineBreak(text)) {
+                // Not written into the mirror: GPUI answers Return with a block
+                // split, so the buffer this mirrors never holds a newline.
+                nativeKeyEnter();
+                return true;
+            }
             Range range = currentReplacementRange();
             boolean result = super.commitText(text, newCursorPosition);
             if (result && !view.applyingNativeState) {
@@ -300,6 +312,29 @@ public final class GpuiTextInputView extends View {
             return result;
         }
 
+        /**
+         * IMEs that answer Return with a key event instead of `commitText`
+         * reach Return through here. Consumed rather than forwarded so both
+         * routes produce exactly one split.
+         */
+        @Override
+        public boolean sendKeyEvent(KeyEvent event) {
+            boolean enter = event.getKeyCode() == KeyEvent.KEYCODE_ENTER
+                    || event.getKeyCode() == KeyEvent.KEYCODE_NUMPAD_ENTER;
+            if (enter) {
+                if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                    nativeKeyEnter();
+                }
+                return true;
+            }
+            return super.sendKeyEvent(event);
+        }
+
+        private static boolean isLineBreak(CharSequence text) {
+            String value = text.toString();
+            return value.equals("\n") || value.equals("\r") || value.equals("\r\n");
+        }
+
         @Override
         public boolean performEditorAction(int actionCode) {
             if ((editorInfo.inputType & InputType.TYPE_TEXT_FLAG_MULTI_LINE) == 0
@@ -377,6 +412,9 @@ public final class GpuiTextInputView extends View {
             int start, int end, String text, int selectionStart, int selectionEnd);
 
     private static native void nativeUnmarkText();
+
+    /** Soft Return, delivered as an `enter` keystroke rather than as text. */
+    private static native void nativeKeyEnter();
 
     private static native void nativeSetSelection(int start, int end);
 }

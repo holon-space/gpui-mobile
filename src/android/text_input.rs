@@ -34,6 +34,11 @@ pub enum TextInputCommand {
         selected_utf16: Range<usize>,
     },
     UnmarkText,
+    /// Soft-keyboard Return. Queued alongside the edits so it keeps its place
+    /// in the typing order, but delivered to gpui as an `enter` keystroke
+    /// rather than as text — a newline written into the buffer would never
+    /// reach the keymap, and the editor's `Enter` action would never run.
+    KeyEnter,
 }
 
 /// An IME call to make from the dedicated JNI thread.
@@ -48,7 +53,6 @@ enum ImeCommand {
 }
 
 static IME_TX: OnceLock<std::sync::mpsc::Sender<ImeCommand>> = OnceLock::new();
-
 
 /// Hand an IME call to the dedicated JNI thread.
 ///
@@ -100,9 +104,10 @@ fn commands() -> &'static Mutex<VecDeque<TextInputCommand>> {
 }
 
 pub fn push(command: TextInputCommand) {
-    if let Ok(mut commands) = commands().lock() {
-        commands.push_back(command);
-    }
+    commands()
+        .lock()
+        .expect("IME command queue mutex poisoned")
+        .push_back(command);
     DIRTY.store(true, Ordering::Release);
     crate::TEXT_INPUT_DIRTY.store(true, Ordering::Release);
     // Deliberately no `request_frame()` here. This runs on the IME's thread, and
@@ -139,17 +144,38 @@ pub fn report_undeliverable_commands() {
 static UNDELIVERABLE_REPORTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-pub fn drain_into(input_handler: &mut PlatformInputHandler) -> bool {
-    let mut drained = false;
+/// How far [`drain_into`] got.
+pub enum Drained {
+    /// The queue ran empty. `edits` reports whether anything was applied.
+    Done { edits: bool },
+    /// Every command queued before a soft Return was applied. The caller must
+    /// dispatch the `enter` keystroke — which cannot happen here, because gpui's
+    /// key dispatch takes the input handler this call still holds — and then
+    /// drain again for whatever follows the Return.
+    AtEnter,
+}
+
+pub fn drain_into(input_handler: &mut PlatformInputHandler) -> Drained {
+    let mut edits = false;
     loop {
-        let command = commands()
-            .lock()
-            .ok()
-            .and_then(|mut commands| commands.pop_front());
-        let Some(command) = command else {
-            break;
+        let command = {
+            let mut queue = commands().lock().expect("IME command queue mutex poisoned");
+            let command = queue.pop_front();
+            if command.is_none() {
+                // Cleared while the queue lock is held: `push` sets the flag
+                // only after releasing that lock, so a concurrent push cannot
+                // have its flag overwritten here.
+                DIRTY.store(false, Ordering::Release);
+            }
+            command
         };
-        drained = true;
+        let Some(command) = command else {
+            return Drained::Done { edits };
+        };
+        if let TextInputCommand::KeyEnter = command {
+            return Drained::AtEnter;
+        }
+        edits = true;
         match command {
             TextInputCommand::ReplaceText { range_utf16, text } => {
                 input_handler.replace_text_in_range(Some(range_utf16), &text);
@@ -168,12 +194,9 @@ pub fn drain_into(input_handler: &mut PlatformInputHandler) -> bool {
             TextInputCommand::UnmarkText => {
                 input_handler.unmark_text();
             }
+            TextInputCommand::KeyEnter => unreachable!("returned above"),
         }
     }
-    if drained {
-        DIRTY.store(false, Ordering::Release);
-    }
-    drained
 }
 
 /// Mirror the editor's text and selection into the Java-side host view.
@@ -347,6 +370,14 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiTextInputView_nativeUnmarkText
     _class: *mut c_void,
 ) {
     push(TextInputCommand::UnmarkText);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiTextInputView_nativeKeyEnter(
+    _env: *mut c_void,
+    _class: *mut c_void,
+) {
+    push(TextInputCommand::KeyEnter);
 }
 
 /// IME-driven selection changes are not propagated: the `gpui` revision this

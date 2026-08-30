@@ -1460,17 +1460,55 @@ impl PlatformWindow for AndroidPlatformWindow {
             // not only when edits were pending: Java's copy is what every
             // `commitText` computes its replacement range from, so leaving it
             // stale sends each keystroke to the wrong offset.
-            let text_input_dirty = if let Some(input_handler) = input_handler.0.lock().as_mut() {
-                let drained = crate::android::text_input::has_pending()
-                    && crate::android::text_input::drain_into(input_handler);
-                crate::android::text_input::sync_state_to_java(input_handler);
-                drained
-            } else {
-                // No handler means no editor is focused. Queued IME edits cannot be
-                // applied and will sit in the queue indefinitely, so say so: the
-                // symptom is otherwise a keyboard that types into nothing.
-                crate::android::text_input::report_undeliverable_commands();
-                false
+            let text_input_dirty = {
+                use crate::android::text_input::{self, Drained};
+
+                let mut edits = false;
+                while text_input::has_pending() {
+                    let step = match input_handler.0.lock().as_mut() {
+                        Some(input_handler) => text_input::drain_into(input_handler),
+                        // The Enter dispatched below can move focus, which
+                        // unsets the handler; the rest of the queue waits for
+                        // the next frame.
+                        None => break,
+                    };
+                    match step {
+                        Drained::Done { edits: applied } => {
+                            edits |= applied;
+                            break;
+                        }
+                        Drained::AtEnter => {
+                            edits = true;
+                            // Dispatched with the handler lock released: gpui's
+                            // key dispatch takes the handler itself, and the
+                            // mutex is not reentrant.
+                            let mut cb = input_cb.lock();
+                            let result = cb(gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                                keystroke: gpui::Keystroke {
+                                    modifiers: gpui::Modifiers::default(),
+                                    key: "enter".to_string(),
+                                    key_char: None,
+                                },
+                                is_held: false,
+                                prefer_character_input: false,
+                            }));
+                            if result.propagate {
+                                log::debug!(
+                                    "soft Return reached no handler — the focused element \
+                                     binds no `enter` action, so nothing was split"
+                                );
+                            }
+                        }
+                    }
+                }
+                match input_handler.0.lock().as_mut() {
+                    Some(input_handler) => text_input::sync_state_to_java(input_handler),
+                    // No handler means no editor is focused. Queued IME edits cannot be
+                    // applied and will sit in the queue indefinitely, so say so: the
+                    // symptom is otherwise a keyboard that types into nothing.
+                    None => text_input::report_undeliverable_commands(),
+                }
+                edits
             };
 
             // Check if text input arrived since last frame — if so, force a
