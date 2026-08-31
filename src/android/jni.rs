@@ -723,6 +723,7 @@ pub fn run_event_loop(app: &AndroidApp) {
                         existing.update_safe_area_from_content_rect(
                             cr.left, cr.top, cr.right, cr.bottom,
                         );
+                        refresh_keyboard_height(existing.scale_factor());
 
                         INIT_WINDOW_DONE.store(true, Ordering::Relaxed);
                     } else {
@@ -738,6 +739,7 @@ pub fn run_event_loop(app: &AndroidApp) {
                                 win.update_safe_area_from_content_rect(
                                     cr.left, cr.top, cr.right, cr.bottom,
                                 );
+                                refresh_keyboard_height(win.scale_factor());
                             }
                             Err(e) => {
                                 log::error!("failed to open window: {e:#}");
@@ -758,6 +760,7 @@ pub fn run_event_loop(app: &AndroidApp) {
                     win.handle_resize();
                     let cr = app.content_rect();
                     win.update_safe_area_from_content_rect(cr.left, cr.top, cr.right, cr.bottom);
+                    refresh_keyboard_height(win.scale_factor());
                 }
             }
         }
@@ -1148,6 +1151,123 @@ pub fn init_platform(app: &AndroidApp) -> &'static Arc<AndroidPlatform> {
 static LAST_CHROME_STYLE: std::sync::Mutex<
     Option<(Option<u32>, Option<u32>, crate::StatusBarContentStyle)>,
 > = std::sync::Mutex::new(None);
+
+/// Refresh the software keyboard height from the IME window inset.
+///
+/// With `adjustResize` the IME shrinks the same content rect the system bars
+/// do, so the safe-area inset cannot say how much of the bottom is KEYBOARD as
+/// opposed to nav bar or gesture area. A caller asking "is the keyboard up" —
+/// rather than "how much bottom space is unusable" — needs the IME inset
+/// specifically.
+///
+/// Reads `decorView.getRootWindowInsets().getInsets(WindowInsets.Type.ime())`
+/// and publishes its bottom edge in LOGICAL points through
+/// [`crate::set_keyboard_height`], the same signal the iOS window feeds, so
+/// callers read one cross-platform accessor.
+///
+/// The call needs API 30+, which every supported build has (minSdk 33), so a
+/// failure here is a programming or environment error rather than a device we
+/// have to degrade for. It is reported loudly and NO value is published: a
+/// silent fall back to the last height reads as "keyboard down" forever, and a
+/// consumer gating an affordance on it would simply never show it, with nothing
+/// in the log to say why.
+pub fn refresh_keyboard_height(scale_factor: f32) {
+    let result = with_env(|jni_env| {
+        let activity_obj = activity(jni_env)?;
+        let window = jni_env
+            .call_method(
+                &activity_obj,
+                jni::jni_str!("getWindow"),
+                jni::jni_sig!("()Landroid/view/Window;"),
+                &[],
+            )
+            .and_then(|v: jni::objects::JValueOwned| v.l())
+            .map_err(|e| {
+                jni_env.exception_clear();
+                e.to_string()
+            })?;
+        let decor = jni_env
+            .call_method(
+                &window,
+                jni::jni_str!("getDecorView"),
+                jni::jni_sig!("()Landroid/view/View;"),
+                &[],
+            )
+            .and_then(|v: jni::objects::JValueOwned| v.l())
+            .map_err(|e| {
+                jni_env.exception_clear();
+                e.to_string()
+            })?;
+        let insets_obj = jni_env
+            .call_method(
+                &decor,
+                jni::jni_str!("getRootWindowInsets"),
+                jni::jni_sig!("()Landroid/view/WindowInsets;"),
+                &[],
+            )
+            .and_then(|v: jni::objects::JValueOwned| v.l())
+            .map_err(|e| {
+                jni_env.exception_clear();
+                e.to_string()
+            })?;
+        if insets_obj.is_null() {
+            return Err("getRootWindowInsets returned null".into());
+        }
+        let ime_type = jni_env
+            .call_static_method(
+                jni::jni_str!("android/view/WindowInsets$Type"),
+                jni::jni_str!("ime"),
+                jni::jni_sig!("()I"),
+                &[],
+            )
+            .and_then(|v: jni::objects::JValueOwned| v.i())
+            .map_err(|e| {
+                jni_env.exception_clear();
+                e.to_string()
+            })?;
+        let ime_insets = jni_env
+            .call_method(
+                &insets_obj,
+                jni::jni_str!("getInsets"),
+                jni::jni_sig!("(I)Landroid/graphics/Insets;"),
+                &[JValue::Int(ime_type)],
+            )
+            .and_then(|v: jni::objects::JValueOwned| v.l())
+            .map_err(|e| {
+                jni_env.exception_clear();
+                e.to_string()
+            })?;
+        if ime_insets.is_null() {
+            return Err("getInsets(ime) returned null".into());
+        }
+        // `Insets.bottom` is a public int FIELD, in physical px.
+        let bottom = jni_env
+            .get_field(&ime_insets, jni::jni_str!("bottom"), jni::jni_sig!("I"))
+            .and_then(|v: jni::objects::JValueOwned| v.i())
+            .map_err(|e| {
+                jni_env.exception_clear();
+                e.to_string()
+            })?;
+        Ok(bottom as f32)
+    });
+
+    match result {
+        Ok(physical) => {
+            let scale = if scale_factor > 0.0 {
+                scale_factor
+            } else {
+                1.0
+            };
+            crate::set_keyboard_height(physical / scale);
+        }
+        Err(e) => {
+            log::error!(
+                "failed to read the IME window inset: {e} — the keyboard height is now stale, so \
+                 anything gated on it (the mobile action bar) behaves as if the keyboard were down"
+            );
+        }
+    }
+}
 
 /// Apply system chrome styling on Android.
 ///
