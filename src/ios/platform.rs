@@ -12,15 +12,16 @@ use super::{IosDispatcher, IosDisplay, IosWindow};
 use anyhow::anyhow;
 use futures::channel::oneshot;
 use gpui::{
-    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DummyKeyboardMapper,
-    ForegroundExecutor, Keymap, Menu, MenuItem, PathPromptOptions, Platform, PlatformDisplay,
-    PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, Result,
-    Task, ThermalState, WindowAppearance, WindowParams,
+    Action, ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle,
+    DummyKeyboardMapper, ForegroundExecutor, Keymap, Menu, MenuItem, PathPromptOptions, Platform,
+    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    PlatformWindow, Result, Task, ThermalState, WindowAppearance, WindowParams,
 };
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
 use parking_lot::Mutex;
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -33,7 +34,7 @@ pub(crate) struct IosPlatformState {
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
     finish_launching: Option<Box<dyn FnOnce()>>,
-    quit_callback: Option<Box<dyn FnMut()>>,
+    quit_callback: Option<Box<dyn FnMut() -> bool>>,
     open_urls_callback: Option<Box<dyn FnMut(Vec<String>)>>,
     thermal_state_callback: Option<Box<dyn FnMut()>>,
 }
@@ -119,7 +120,7 @@ impl Platform for IosPlatform {
         log::warn!("iOS apps cannot programmatically quit");
     }
 
-    fn restart(&self, _binary_path: Option<PathBuf>) {
+    fn restart(&self, _binary_path: Option<PathBuf>, _arguments: Vec<OsString>) {
         // iOS apps cannot restart themselves
         log::warn!("iOS apps cannot restart themselves");
     }
@@ -239,12 +240,20 @@ impl Platform for IosPlatform {
         // Would use UIDocumentInteractionController or UIActivityViewController
     }
 
-    fn on_quit(&self, callback: Box<dyn FnMut()>) {
+    fn on_quit(&self, callback: Box<dyn FnMut() -> bool>) {
         self.0.lock().quit_callback = Some(callback);
     }
 
     fn on_reopen(&self, _callback: Box<dyn FnMut()>) {
         // iOS handles app reopening through scene lifecycle
+    }
+
+    fn on_system_sleep(&self, _callback: Box<dyn FnMut()>) {
+        log::warn!("GPUI iOS: on_system_sleep is not supported; the callback never fires");
+    }
+
+    fn on_system_wake(&self, _callback: Box<dyn FnMut()>) {
+        log::warn!("GPUI iOS: on_system_wake is not supported; the callback never fires");
     }
 
     fn set_menus(&self, _menus: Vec<Menu>, _keymap: &Keymap) {
@@ -288,6 +297,12 @@ impl Platform for IosPlatform {
 
     fn set_cursor_style(&self, _style: CursorStyle) {
         // iOS doesn't have visible cursors (except for Apple Pencil hover on iPad)
+    }
+
+    fn hide_cursor_until_mouse_moves(&self) {}
+
+    fn is_cursor_visible(&self) -> bool {
+        false
     }
 
     fn should_auto_hide_scrollbars(&self) -> bool {
@@ -348,6 +363,12 @@ impl Platform for IosPlatform {
         self.0.lock().thermal_state_callback = Some(callback);
         // In a full implementation, we would register for
         // NSProcessInfoThermalStateDidChangeNotification
+    }
+
+    fn prevent_idle_sleep(&self, reason: &str) -> Task<Result<ActivityGuard>> {
+        Task::ready(Err(anyhow!(
+            "Idle sleep prevention for {reason:?} is not implemented on iOS"
+        )))
     }
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {

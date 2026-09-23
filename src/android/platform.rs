@@ -35,9 +35,9 @@
 use anyhow::Result;
 use futures::channel::oneshot;
 use gpui::{
-    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
-    KeybindingKeystroke, Keymap, Keystroke, Menu, MenuItem, PathPromptOptions, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    Action, ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle,
+    ForegroundExecutor, KeybindingKeystroke, Keymap, Keystroke, Menu, MenuItem, PathPromptOptions,
+    Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
     PlatformWindow, Task, ThermalState, WindowAppearance, WindowParams,
 };
 use gpui_wgpu::CosmicTextSystem;
@@ -45,6 +45,7 @@ use parking_lot::Mutex;
 use std::{
     cell::RefCell,
     collections::HashMap,
+    ffi::OsString,
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
@@ -146,7 +147,7 @@ struct AndroidPlatformState {
     finish_launching: Option<Box<dyn FnOnce() + Send>>,
 
     /// Called when the app is about to quit.
-    quit_callback: Option<Box<dyn FnMut() + Send>>,
+    quit_callback: Option<Box<dyn FnMut() -> bool + Send>>,
 
     /// Called when the app is re-opened (e.g. tapped in the recents screen
     /// while already running).
@@ -519,7 +520,7 @@ impl AndroidPlatform {
 
         let cb = self.state.lock().quit_callback.as_mut().map(|cb| {
             // We cannot move out of an `&mut FnMut`, so we call it in place.
-            cb as *mut Box<dyn FnMut() + Send>
+            cb as *mut Box<dyn FnMut() -> bool + Send>
         });
 
         if let Some(cb_ptr) = cb {
@@ -895,7 +896,7 @@ impl AndroidPlatform {
     /// Register a callback invoked when the app is about to quit.
     pub fn on_quit<F>(&self, cb: F)
     where
-        F: FnMut() + Send + 'static,
+        F: FnMut() -> bool + Send + 'static,
     {
         self.state.lock().quit_callback = Some(Box::new(cb));
     }
@@ -983,7 +984,7 @@ impl Platform for AndroidPlatform {
             .lock()
             .quit_callback
             .as_mut()
-            .map(|cb| cb as *mut Box<dyn FnMut() + Send>);
+            .map(|cb| cb as *mut Box<dyn FnMut() -> bool + Send>);
 
         if let Some(cb_ptr) = cb {
             // SAFETY: pointer is valid for the duration of this call because
@@ -992,7 +993,7 @@ impl Platform for AndroidPlatform {
         }
     }
 
-    fn restart(&self, _binary_path: Option<PathBuf>) {
+    fn restart(&self, _binary_path: Option<PathBuf>, _arguments: Vec<OsString>) {
         log::warn!("AndroidPlatform::restart — not supported on Android");
     }
 
@@ -1122,10 +1123,20 @@ impl Platform for AndroidPlatform {
         log::info!("AndroidPlatform::open_with_system — Intent launch not yet implemented");
     }
 
-    fn on_quit(&self, callback: Box<dyn FnMut()>) {
+    fn on_quit(&self, callback: Box<dyn FnMut() -> bool>) {
         self.state.lock().quit_callback = Some(unsafe {
-            std::mem::transmute::<Box<dyn FnMut()>, Box<dyn FnMut() + Send>>(callback)
+            std::mem::transmute::<Box<dyn FnMut() -> bool>, Box<dyn FnMut() -> bool + Send>>(
+                callback,
+            )
         });
+    }
+
+    fn on_system_sleep(&self, _callback: Box<dyn FnMut()>) {
+        log::warn!("AndroidPlatform::on_system_sleep is not supported; the callback never fires");
+    }
+
+    fn on_system_wake(&self, _callback: Box<dyn FnMut()>) {
+        log::warn!("AndroidPlatform::on_system_wake is not supported; the callback never fires");
     }
 
     fn on_reopen(&self, callback: Box<dyn FnMut()>) {
@@ -1181,6 +1192,18 @@ impl Platform for AndroidPlatform {
 
     fn set_cursor_style(&self, _style: CursorStyle) {
         // No-op: Android uses touch, not mouse cursors.
+    }
+
+    fn hide_cursor_until_mouse_moves(&self) {}
+
+    fn is_cursor_visible(&self) -> bool {
+        false
+    }
+
+    fn prevent_idle_sleep(&self, reason: &str) -> Task<Result<ActivityGuard>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "Idle sleep prevention for {reason:?} is not implemented on Android"
+        )))
     }
 
     fn should_auto_hide_scrollbars(&self) -> bool {
@@ -1307,8 +1330,8 @@ impl Platform for SharedPlatform {
     fn quit(&self) {
         <AndroidPlatform as Platform>::quit(&self.0)
     }
-    fn restart(&self, binary_path: Option<PathBuf>) {
-        <AndroidPlatform as Platform>::restart(&self.0, binary_path)
+    fn restart(&self, binary_path: Option<PathBuf>, arguments: Vec<OsString>) {
+        <AndroidPlatform as Platform>::restart(&self.0, binary_path, arguments)
     }
     fn activate(&self, ignoring_other_apps: bool) {
         <AndroidPlatform as Platform>::activate(&self.0, ignoring_other_apps)
@@ -1372,8 +1395,14 @@ impl Platform for SharedPlatform {
     fn open_with_system(&self, path: &Path) {
         <AndroidPlatform as Platform>::open_with_system(&self.0, path)
     }
-    fn on_quit(&self, callback: Box<dyn FnMut()>) {
+    fn on_quit(&self, callback: Box<dyn FnMut() -> bool>) {
         <AndroidPlatform as Platform>::on_quit(&self.0, callback)
+    }
+    fn on_system_sleep(&self, callback: Box<dyn FnMut()>) {
+        <AndroidPlatform as Platform>::on_system_sleep(&self.0, callback)
+    }
+    fn on_system_wake(&self, callback: Box<dyn FnMut()>) {
+        <AndroidPlatform as Platform>::on_system_wake(&self.0, callback)
     }
     fn on_reopen(&self, callback: Box<dyn FnMut()>) {
         <AndroidPlatform as Platform>::on_reopen(&self.0, callback)
@@ -1407,6 +1436,15 @@ impl Platform for SharedPlatform {
     }
     fn set_cursor_style(&self, style: CursorStyle) {
         <AndroidPlatform as Platform>::set_cursor_style(&self.0, style)
+    }
+    fn hide_cursor_until_mouse_moves(&self) {
+        <AndroidPlatform as Platform>::hide_cursor_until_mouse_moves(&self.0)
+    }
+    fn is_cursor_visible(&self) -> bool {
+        <AndroidPlatform as Platform>::is_cursor_visible(&self.0)
+    }
+    fn prevent_idle_sleep(&self, reason: &str) -> Task<Result<ActivityGuard>> {
+        <AndroidPlatform as Platform>::prevent_idle_sleep(&self.0, reason)
     }
     fn should_auto_hide_scrollbars(&self) -> bool {
         <AndroidPlatform as Platform>::should_auto_hide_scrollbars(&self.0)
@@ -1491,6 +1529,7 @@ mod tests {
         let f2 = fired.clone();
         p.on_quit(move || {
             f2.store(true, Ordering::Relaxed);
+            true
         });
         p.quit();
         assert!(fired.load(Ordering::Relaxed));
